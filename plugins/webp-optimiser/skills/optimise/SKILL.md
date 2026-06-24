@@ -28,6 +28,10 @@ path is correct after installation:
   ```powershell
   python "$env:CLAUDE_PLUGIN_ROOT/skills/optimise/scripts/optimise.py" <paths…> [options]
   ```
+- **cmd.exe (Windows):**
+  ```cmd
+  python "%CLAUDE_PLUGIN_ROOT%\skills\optimise\scripts\optimise.py" <paths…> [options]
+  ```
 
 If `python` is not found, try `python3`. The script only needs **Pillow**; if it
 reports Pillow is missing, run `python -m pip install Pillow` (or add `--auto-install`).
@@ -47,9 +51,10 @@ else → lossy quality 80.
 
 ## Adjust to the request
 
-- "replace the originals" / "optimise in place" → add `--replace` (it auto-keeps an
+- "put the .webp next to the originals" / "optimise in place" / "same folder" → add
+  `--in-place` (non-destructive: keeps the originals).
+- "replace the originals" / "delete the originals" → add `--replace` (it auto-keeps an
   original when the WebP would be larger). Always combine with `--archive` for safety.
-- "put them next to the originals" → add `--in-place`.
 - "higher/lower quality", "lossless", "lossy" → use `-q <0-100>` and/or
   `--mode {smart,lossy,lossless}`.
 - "only this folder, not subfolders" → add `--no-recursive`.

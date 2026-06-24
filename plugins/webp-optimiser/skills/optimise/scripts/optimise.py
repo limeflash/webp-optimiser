@@ -34,6 +34,7 @@ from pathlib import Path
 
 DEFAULT_FORMATS = ["png", "jpg", "jpeg", "gif", "tiff", "tif", "bmp"]
 DEFAULT_OUTPUT_DIR = "webp-optimised"
+HIGH_BIT_MODES = ("I", "I;16", "I;16B", "I;16L", "F")
 
 
 # --------------------------------------------------------------------------- #
@@ -93,16 +94,20 @@ def collect_images(paths, formats, recursive):
 
     base_dir is the root used to compute the mirrored output path. For a file
     argument the base is the file's parent; for a directory it is the directory.
+    Duplicate physical files (resolved) are only listed once.
     """
     exts = {f".{f.lower().lstrip('.')}" for f in formats}
     found = []
     seen = set()
 
     def add(img_path: Path, base: Path):
-        rp = img_path.resolve()
-        if rp in seen:
+        try:
+            key = img_path.resolve()
+        except OSError:
+            key = img_path.absolute()
+        if key in seen:
             return
-        seen.add(rp)
+        seen.add(key)
         found.append((img_path, base))
 
     for raw in paths:
@@ -124,15 +129,52 @@ def collect_images(paths, formats, recursive):
     return found
 
 
+def rel_to_base(path: Path, base: Path) -> Path:
+    """Path of `path` relative to `base`, using the lexical path first.
+
+    Lexical first keeps the mirrored sub-directory layout even for symlinks
+    (where resolve() could point outside base). Falls back to the bare name.
+    """
+    try:
+        return path.relative_to(base)
+    except ValueError:
+        try:
+            return path.resolve().relative_to(base.resolve())
+        except (ValueError, OSError):
+            return Path(path.name)
+
+
 def output_path_for(img_path: Path, base: Path, output_dir: Path, in_place: bool) -> Path:
-    """Compute the .webp destination for an image."""
+    """Compute the (pre-collision) .webp destination for an image."""
     if in_place:
         return img_path.with_suffix(".webp")
-    try:
-        rel = img_path.resolve().relative_to(base.resolve())
-    except ValueError:
-        rel = Path(img_path.name)
-    return (output_dir / rel).with_suffix(".webp")
+    return (output_dir / rel_to_base(img_path, base)).with_suffix(".webp")
+
+
+def plan_outputs(images, output_dir: Path, in_place: bool):
+    """Assign a unique .webp destination to every image.
+
+    Two different sources can map to the same default name (e.g. a.png + a.jpg
+    -> a.webp, or same-named files from different folders). To avoid silently
+    overwriting one with another — and, under --replace, deleting both originals
+    while keeping only one result — colliding destinations get a -1, -2, ...
+    suffix. Returns (plan, had_collisions) where plan is a list of
+    (img_path, base, dest).
+    """
+    used = set()
+    plan = []
+    collisions = False
+    for img_path, base in images:
+        dest = output_path_for(img_path, base, output_dir, in_place)
+        cand = dest
+        n = 1
+        while str(cand).casefold() in used:
+            collisions = True
+            cand = dest.with_name(f"{dest.stem}-{n}{dest.suffix}")
+            n += 1
+        used.add(str(cand).casefold())
+        plan.append((img_path, base, cand))
+    return plan, collisions
 
 
 def is_animated(img) -> bool:
@@ -147,16 +189,22 @@ def normalise_mode(img):
         return img.convert("RGBA" if "transparency" in img.info else "RGB")
     if img.mode == "LA":
         return img.convert("RGBA")
-    if img.mode == "CMYK":
+    if img.mode in ("CMYK", "YCbCr", "HSV"):
         return img.convert("RGB")
+    if img.mode in HIGH_BIT_MODES:
+        return img.convert("L")  # high bit-depth -> 8-bit (warned in save_static)
     return img.convert("RGBA")
 
 
-def save_static(img, dest: Path, lossless: bool, quality: int):
-    from PIL import Image  # noqa: F401
+def save_static(img, dest: Path, lossless: bool, quality: int, method: int):
+    from PIL import ImageOps
 
+    img = ImageOps.exif_transpose(img)  # bake in EXIF orientation; WebP drops EXIF
+    if lossless and img.mode in HIGH_BIT_MODES:
+        print(f"  note: {dest.name}: {img.mode} reduced to 8-bit "
+              f"(WebP has no high-bit-depth lossless)", file=sys.stderr)
     img = normalise_mode(img)
-    params = {"format": "WEBP", "method": 6}
+    params = {"format": "WEBP", "method": method}
     if lossless:
         params.update(lossless=True, quality=100)
     else:
@@ -164,18 +212,18 @@ def save_static(img, dest: Path, lossless: bool, quality: int):
     img.save(dest, **params)
 
 
-def save_animated(img, dest: Path, lossless: bool, quality: int):
+def save_animated(img, dest: Path, lossless: bool, quality: int, method: int):
     frames = []
     durations = []
     n = getattr(img, "n_frames", 1)
     for i in range(n):
-        img.seek(i)
+        img.seek(i)  # Pillow composites partial frames + disposal on seek
         frames.append(img.convert("RGBA"))
         durations.append(img.info.get("duration", 100))
     loop = img.info.get("loop", 0)
     params = {
         "format": "WEBP",
-        "method": 6,
+        "method": method,
         "save_all": True,
         "append_images": frames[1:],
         "duration": durations,
@@ -201,16 +249,30 @@ def choose_lossless(img_path: Path, mode: str) -> bool:
 # Archiving
 # --------------------------------------------------------------------------- #
 def archive_originals(images, output_dir: Path) -> Path:
+    """Zip every original into the output folder, with collision-free arcnames."""
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     zip_path = output_dir / f"_originals-backup-{stamp}.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for img_path, base in images:
-            try:
-                arcname = img_path.resolve().relative_to(base.resolve())
-            except ValueError:
-                arcname = Path(img_path.name)
-            zf.write(img_path, arcname.as_posix())
+    used = set()
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for img_path, base in images:
+                arc = rel_to_base(img_path, base).as_posix()
+                key = arc.casefold()
+                n = 1
+                while key in used:  # never let one backup entry shadow another
+                    p = Path(arc)
+                    arc = p.with_name(f"{p.stem}-{n}{p.suffix}").as_posix()
+                    key = arc.casefold()
+                    n += 1
+                used.add(key)
+                zf.write(img_path, arc)
+    except Exception:
+        try:
+            zip_path.unlink()  # don't leave a half-written backup behind
+        except OSError:
+            pass
+        raise
     return zip_path
 
 
@@ -243,6 +305,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="compression mode (default: smart — PNG lossless, others lossy)",
     )
     parser.add_argument(
+        "--method", type=int, default=6,
+        help="WebP compression effort 0-6, higher = smaller but slower (default: 6)",
+    )
+    parser.add_argument(
         "--in-place", action="store_true",
         help="write .webp next to each source instead of into the output folder",
     )
@@ -269,11 +335,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    require_pillow(args.auto_install)
-    from PIL import Image, UnidentifiedImageError
 
-    if args.quality < 0 or args.quality > 100:
+    if not 0 <= args.quality <= 100:
         print("error: --quality must be between 0 and 100", file=sys.stderr)
+        return 2
+    if not 0 <= args.method <= 6:
+        print("error: --method must be between 0 and 6", file=sys.stderr)
         return 2
 
     in_place = args.in_place or args.replace
@@ -285,12 +352,28 @@ def main(argv=None) -> int:
         print("No supported images found.")
         return 0
 
+    plan, collisions = plan_outputs(images, output_dir, in_place)
+    if collisions:
+        print("note: some images would share an output name; the later ones were "
+              "renamed (-1, -2, …) so nothing is overwritten.", file=sys.stderr)
+
     print(f"Found {len(images)} image(s). Mode: {args.mode}"
           + ("" if in_place else f"  ->  {output_dir}")
           + (" [dry-run]" if args.dry_run else ""))
 
+    # Dry run never imports Pillow and never writes (no archive, no convert).
+    if args.dry_run:
+        for img_path, _base, dest in plan:
+            print(f"  would convert {img_path}  ->  {dest}")
+        print("-" * 48)
+        print(f"Dry run: {len(plan)} image(s) would be processed.")
+        return 0
+
+    require_pillow(args.auto_install)
+    from PIL import Image, UnidentifiedImageError
+
     # Archive originals up front (so a later --replace can't lose data).
-    if args.archive and not args.dry_run:
+    if args.archive:
         zip_path = archive_originals(images, output_dir)
         print(f"Archived {len(images)} original(s) -> {zip_path}")
 
@@ -299,16 +382,22 @@ def main(argv=None) -> int:
     converted = 0
     skipped = 0
     failed = 0
+    replace_errors = 0
 
-    for img_path, base in images:
-        dest = output_path_for(img_path, base, output_dir, in_place)
+    for img_path, _base, dest in plan:
         try:
             orig_size = img_path.stat().st_size
         except OSError:
             orig_size = 0
 
-        if args.dry_run:
-            print(f"  would convert {img_path}  ->  {dest}")
+        # Never write onto / delete the source itself.
+        try:
+            same = img_path.resolve() == dest.resolve()
+        except OSError:
+            same = False
+        if same:
+            print(f"  {img_path.name}: source is already the target — skipped")
+            skipped += 1
             continue
 
         try:
@@ -316,9 +405,9 @@ def main(argv=None) -> int:
                 lossless = choose_lossless(img_path, args.mode)
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 if is_animated(img):
-                    save_animated(img, dest, lossless, args.quality)
+                    save_animated(img, dest, lossless, args.quality, args.method)
                 else:
-                    save_static(img, dest, lossless, args.quality)
+                    save_static(img, dest, lossless, args.quality, args.method)
         except (UnidentifiedImageError, OSError, ValueError) as exc:
             print(f"  FAILED  {img_path}: {exc}", file=sys.stderr)
             failed += 1
@@ -328,13 +417,11 @@ def main(argv=None) -> int:
         total_in += orig_size
         total_out += new_size
         converted += 1
-
         pct = (1 - new_size / orig_size) * 100 if orig_size else 0.0
-        flag = ""
+
         if new_size >= orig_size and orig_size:
-            flag = "  (no gain — original is smaller)"
             if args.replace:
-                # don't destroy a smaller original for a larger webp
+                # Don't destroy a smaller original for a larger webp.
                 try:
                     dest.unlink()
                 except OSError:
@@ -346,31 +433,33 @@ def main(argv=None) -> int:
                 total_in -= orig_size
                 skipped += 1
                 continue
+            print(f"  {img_path.name}: {human_size(orig_size)} -> "
+                  f"{human_size(new_size)} ({fmt_delta(pct)})  (no gain — original is smaller)")
+            continue
 
         print(f"  {img_path.name}: {human_size(orig_size)} -> "
-              f"{human_size(new_size)} ({fmt_delta(pct)}){flag}")
+              f"{human_size(new_size)} ({fmt_delta(pct)})")
 
-        if args.replace and not flag:
+        if args.replace:
             try:
                 img_path.unlink()
             except OSError as exc:
                 print(f"    note: could not remove original {img_path}: {exc}", file=sys.stderr)
+                replace_errors += 1
 
     # Summary
     print("-" * 48)
-    if args.dry_run:
-        print(f"Dry run: {len(images)} image(s) would be processed.")
-        return 0
-
     saved = total_in - total_out
     overall = (saved / total_in * 100) if total_in else 0.0
     print(f"Converted {converted} image(s)"
           + (f", skipped {skipped}" if skipped else "")
-          + (f", {failed} failed" if failed else "") + ".")
+          + (f", {failed} failed" if failed else "")
+          + (f", {replace_errors} original(s) not removed" if replace_errors else "")
+          + ".")
     if converted:
         print(f"Total: {human_size(total_in)} -> {human_size(total_out)}  "
               f"(saved {human_size(saved)}, {overall:.0f}%)")
-    return 1 if failed and converted == 0 else 0
+    return 1 if (failed or replace_errors) else 0
 
 
 if __name__ == "__main__":

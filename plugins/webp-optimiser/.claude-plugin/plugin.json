@@ -1,7 +1,7 @@
 {
   "name": "webp-optimiser",
   "displayName": "WebP Optimiser",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Convert and optimise images (PNG, JPG, GIF, TIFF, BMP) to WebP with smart lossy/lossless compression, a separate output folder, and original-archiving. Reports size savings.",
   "author": {
     "name": "limeflash",

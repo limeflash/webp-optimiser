@@ -69,6 +69,7 @@ python optimise.py ./img --dry-run
 | `-o, --output-dir DIR` | Output folder for `.webp` (default `./webp-optimised`). |
 | `-q, --quality 0-100` | Lossy quality (default `80`). |
 | `--mode {smart,lossy,lossless}` | Compression mode (default `smart`). |
+| `--method 0-6` | WebP compression effort (default `6`; lower = faster, larger). |
 | `--in-place` | Write `.webp` next to each source. |
 | `--replace` | Delete the original after a successful, size-reducing conversion (implies `--in-place`). |
 | `--archive` | Zip all originals into the output folder before converting. |
