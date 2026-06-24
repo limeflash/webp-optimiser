@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "webp-optimiser",
+  "owner": {
+    "name": "limeflash",
+    "url": "https://github.com/limeflash"
+  },
+  "description": "WebP image optimisation for Claude Code.",
+  "plugins": [
+    {
+      "name": "webp-optimiser",
+      "source": "./plugins/webp-optimiser",
+      "description": "Convert & optimise images to WebP with smart compression and original-archiving.",
+      "category": "productivity",
+      "keywords": ["webp", "image", "optimization", "assets"]
+    }
+  ]
+}
